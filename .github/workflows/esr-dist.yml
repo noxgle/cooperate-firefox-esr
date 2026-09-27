@@ -1,8 +1,6 @@
 name: esr-dist (Tier-1 fork redistribution)
 # Manual, stability-first: a human pins ESR_VER and clicks "Run workflow".
-# Publishes tandem-esr-<ver>.tar.gz + .sha256 to THIS repo's Releases for
-# cooperate-browser's scripts/install-esr.sh (FF_ESR_DIST_URL default).
-# No cron, no "latest" tracking.
+# No cron, no "latest" tracking. See docs/native-plan.md (fork section).
 on:
   workflow_dispatch:
     inputs:
@@ -22,18 +20,23 @@ jobs:
         run: |
           set -euo pipefail
           REL="${{ inputs.esr_ver }}esr"
-          BASE="https://archive.mozilla.org/pub/firefox/releases/${REL}/linux-x86_64/en-US"
+          MIRRORS="https://archive.mozilla.org/pub/firefox/releases https://download-installer.cdn.mozilla.net/pub/firefox/releases https://ftp.mozilla.org/pub/firefox/releases"
           mkdir -p dist-work && cd dist-work
-          for ext in tar.xz tar.bz2; do
-            if curl -fsSL --retry 3 -o "firefox-${REL}.${ext}" "${BASE}/firefox-${REL}.${ext}"; then
-              echo "ARCHIVE_EXT=${ext}" >> "$GITHUB_ENV"
-              break
-            fi
+          ARCHIVE_EXT=""; TARBALL_BASE=""
+          for mirror in $MIRRORS; do
+            BASE="$mirror/${REL}/linux-x86_64/en-US"
+            for ext in tar.xz tar.bz2; do
+              if curl -fsSL --retry 3 -o "firefox-${REL}.${ext}" "${BASE}/firefox-${REL}.${ext}"; then
+                ARCHIVE_EXT="$ext"; TARBALL_BASE="$mirror"; break 2
+              fi
+            done
           done
-          test -n "${ARCHIVE_EXT:-}" || { echo "no tarball for $REL"; exit 1; }
-          curl -fsSL -o SHA256SUMS "${BASE%/linux-x86_64/en-US}/SHA256SUMS"
+          test -n "${ARCHIVE_EXT:-}" || { echo "no tarball for $REL on any mirror"; exit 1; }
+          echo "ARCHIVE_EXT=${ARCHIVE_EXT}" >> "$GITHUB_ENV"
+          echo "TARBALL_BASE=${TARBALL_BASE}" >> "$GITHUB_ENV"
+          echo "fetched from $TARBALL_BASE"
+          curl -fsSL -o SHA256SUMS "${TARBALL_BASE}/${REL}/SHA256SUMS"
           python3 - <<'EOF'
-          import hashlib
           import os
           rel = "${{ inputs.esr_ver }}esr"
           ext = os.environ["ARCHIVE_EXT"]
@@ -46,6 +49,7 @@ jobs:
                       want = parts[0]
                       break
           assert want, f"no checksum line for {target}"
+          import hashlib
           got = hashlib.sha256(open(f"firefox-{rel}.{ext}", "rb").read()).hexdigest()
           assert want == got, f"SHA256 mismatch want={want[:12]} got={got[:12]}"
           print(f"OK SHA256 {got[:12]}")
@@ -56,18 +60,19 @@ jobs:
           set -euo pipefail
           cd dist-work
           REL="${{ inputs.esr_ver }}esr"
-          # Byte-identical upstream bits + provenance only: extract, drop
-          # tandem-provenance.json next to firefox/, repack. Extension
-          # policies/profile/XPI are written at install time by the
-          # cooperate-browser installer (paths contain $HOME).
+          # The fork ships byte-identical upstream bits + provenance only:
+          # extract official tarball, drop tandem-provenance.json next to
+          # firefox/, repack. policies.json / profile / XPI are written at
+          # install time by scripts/install-esr.sh (paths contain $HOME).
           tar xf "firefox-${REL}.${ARCHIVE_EXT}"
           test -x firefox/firefox || { echo "unexpected tarball layout"; exit 1; }
           python3 - <<'EOF'
           import json, datetime
+          rel = "${{ inputs.esr_ver }}esr"
           doc = {
               "fork": "noxgle/cooperate-firefox-esr",
               "branch": "esr-140-cooperate",
-              "upstream": "https://archive.mozilla.org/pub/firefox/releases/${{ inputs.esr_ver }}esr/",
+              "upstream": f"https://archive.mozilla.org/pub/firefox/releases/{rel}/",
               "built": datetime.datetime.utcnow().isoformat() + "Z",
               "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
               "note": "Unmodified upstream ESR + this provenance file. Extension policies are applied at install time.",
@@ -89,7 +94,7 @@ jobs:
           body: |
             Tier-1 redistribution for cooperate-browser (human+agent shared session).
             Unmodified upstream Firefox ESR + provenance. Install: `scripts/install-esr.sh`
-            with default `FF_ESR_DIST_URL` pointing here. Verify: `sha256sum -c`.
+            with `FF_ESR_DIST_URL` pointing here (default). Verify: `sha256sum -c`.
           files: |
             tandem-esr-${{ inputs.esr_ver }}.tar.gz
             tandem-esr-${{ inputs.esr_ver }}.tar.gz.sha256
